@@ -96,6 +96,47 @@ class HeartbeatExportJobTest < ActiveJob::TestCase
     assert_equal "2026-02-11", payload.dig("export_info", "date_range", "end_date")
   end
 
+  test "include_stats adds stats files to zip export" do
+    create_heartbeat(at_time: Time.utc(2026, 2, 10, 9, 0, 0), entity: "src/in_one.rb")
+    create_heartbeat(at_time: Time.utc(2026, 2, 11, 23, 59, 59), entity: "src/in_two.rb")
+
+    HeartbeatExportJob.perform_now(
+      @user.id,
+      all_data: false,
+      include_stats: true,
+      start_date: "2026-02-10",
+      end_date: "2026-02-11"
+    )
+
+    blob = ActiveStorage::Blob.order(created_at: :asc).last
+    entry_names = zip_entry_names(blob.download)
+
+    assert_includes entry_names, "heartbeats_#{@user.slack_uid}_20260210_20260211.json"
+    assert_includes entry_names, "stats/project_durations.csv"
+    assert_includes entry_names, "stats/language_stats.csv"
+    assert_includes entry_names, "stats/editor_stats.csv"
+    assert_includes entry_names, "stats/operating_system_stats.csv"
+    assert_includes entry_names, "stats/category_stats.csv"
+    assert_includes entry_names, "stats/weekly_project_stats.csv"
+    assert_includes entry_names, "stats/coding_rhythm.csv"
+    assert_includes entry_names, "stats/stats.json"
+  end
+
+  test "without include_stats export omits stats files from zip export" do
+    create_heartbeat(at_time: Time.utc(2026, 2, 10, 9, 0, 0), entity: "src/in_one.rb")
+
+    HeartbeatExportJob.perform_now(
+      @user.id,
+      all_data: false,
+      include_stats: false,
+      start_date: "2026-02-10",
+      end_date: "2026-02-10"
+    )
+
+    entry_names = zip_entry_names(ActiveStorage::Blob.order(created_at: :asc).last.download)
+    assert entry_names.none? { |name| name.start_with?("stats/") }
+  end
+
   test "job returns without email and does not send a message" do
     user_without_email = User.create!(
       timezone: "UTC",
@@ -175,5 +216,17 @@ class HeartbeatExportJobTest < ActiveJob::TestCase
     assert_not_nil payload, "Expected zip to include a JSON file"
     assert found_expected_entry, "Expected zip to include #{json_filename}"
     payload
+  end
+
+  def zip_entry_names(zip_bytes)
+    Zip::InputStream.open(StringIO.new(zip_bytes.to_s)) do |stream|
+      entry_names = []
+
+      while (entry = stream.get_next_entry)
+        entry_names << entry.name
+      end
+
+      entry_names
+    end
   end
 end
