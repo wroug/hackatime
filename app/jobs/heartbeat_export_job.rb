@@ -17,7 +17,6 @@ class HeartbeatExportJob < ApplicationJob
     source_type ai_model ai_session ai_subscription_plan ai_input_tokens ai_output_tokens
     ai_prompt_length ai_line_changes human_line_changes
   ].freeze
-  EXPORT_BATCH_SIZE = 1_000
 
   def perform(user_id, all_data:, include_stats: false, start_date: nil, end_date: nil)
     user = User.find_by(id: user_id)
@@ -46,6 +45,7 @@ class HeartbeatExportJob < ApplicationJob
         .order(time: :asc)
     end
 
+    export_data = build_export_data(heartbeats, start_date, end_date)
     user_identifier = user.slack_uid.presence || "user_#{user.id}"
     json_filename = "heartbeats_#{user_identifier}_#{start_date.strftime("%Y%m%d")}_#{end_date.strftime("%Y%m%d")}.json"
     zip_filename = "#{File.basename(json_filename, ".json")}.zip"
@@ -53,7 +53,7 @@ class HeartbeatExportJob < ApplicationJob
     Tempfile.create([ "heartbeat_export", ".zip" ]) do |zip_file|
       Zip::File.open(zip_file.path, create: true) do |archive|
         archive.get_output_stream(json_filename) do |entry|
-          write_export_json(entry, heartbeats:, start_date:, end_date:)
+          entry.write(export_data.to_json)
         end
 
         if include_stats
@@ -87,51 +87,25 @@ class HeartbeatExportJob < ApplicationJob
 
   private
 
-  def write_export_json(stream, heartbeats:, start_date:, end_date:)
-    stream.write("{\"export_info\":")
-    stream.write(export_info_json(heartbeats, start_date, end_date))
-    stream.write(",\"heartbeats\":[")
-
-    first = true
-    each_heartbeat_batch(heartbeats) do |heartbeat|
-      stream.write(",") unless first
-      stream.write(heartbeat_payload(heartbeat).to_json)
-      first = false
-    end
-
-    stream.write("]}")
-  end
-
-  def export_info_json(heartbeats, start_date, end_date)
+  def build_export_data(heartbeats, start_date, end_date)
     {
-      exported_at: Time.current.iso8601,
-      date_range: {
-        start_date: start_date.iso8601,
-        end_date: end_date.iso8601
+      export_info: {
+        exported_at: Time.current.iso8601,
+        date_range: {
+          start_date: start_date.iso8601,
+          end_date: end_date.iso8601
+        },
+        total_heartbeats: heartbeats.count,
+        total_duration_seconds: heartbeats.duration_seconds
       },
-      total_heartbeats: heartbeats.count,
-      total_duration_seconds: heartbeats.duration_seconds
-    }.to_json
-  end
-
-  def each_heartbeat_batch(heartbeats)
-    offset = 0
-
-    loop do
-      batch = heartbeats.limit(EXPORT_BATCH_SIZE).offset(offset).to_a
-      break if batch.empty?
-
-      batch.each { |heartbeat| yield heartbeat }
-      offset += batch.length
-    end
-  end
-
-  def heartbeat_payload(heartbeat)
-    HEARTBEAT_EXPORT_FIELDS.index_with { |field| heartbeat.public_send(field) }.merge(
-      time: Time.at(heartbeat.time).iso8601,
-      created_at: heartbeat.created_at.iso8601,
-      updated_at: heartbeat.updated_at.iso8601
-    )
+      heartbeats: heartbeats.map do |hb|
+        HEARTBEAT_EXPORT_FIELDS.index_with { |f| hb.public_send(f) }.merge(
+          time: Time.at(hb.time).iso8601,
+          created_at: hb.created_at.iso8601,
+          updated_at: hb.updated_at.iso8601
+        )
+      end
+    }
   end
 
   def stats_to_csv(stats)
@@ -167,7 +141,7 @@ class HeartbeatExportJob < ApplicationJob
   end
 
   def build_stats_files(user, heartbeats, start_date, end_date)
-    stats = DashboardData::Snapshots.processed_export_snapshot(
+    stats = DashboardData::Snapshots::processed_export_snapshot(
       user: user,
       scope: heartbeats,
       start_date: start_date,
